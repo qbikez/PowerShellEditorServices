@@ -22,7 +22,8 @@
     <!-- Win10 Update 1 (10586).  The PowerShellv5 constant will be defined for both -->
     <!-- of these versions for anything that should work against both APIs.          -->
     <DefineConstants Condition="'$(PowerShellVersion)' == 'v5r1'">$(DefineConstants);PowerShellv5r1;PowerShellv5</DefineConstants>
-    <DefineConstants Condition="'$(PowerShellVersion)' == 'v5r2' Or '$(PowerShellVersion)' == ''">$(DefineConstants);PowerShellv5r2;PowerShellv5</DefineConstants>
+    <DefineConstants Condition="'$(PowerShellVersion)' == 'v5r2'">$(DefineConstants);PowerShellv5r2;PowerShellv5</DefineConstants>
+    <DefineConstants Condition="'$(PowerShellVersion)' == ''">$(DefineConstants);PowerShellv5r1;PowerShellv5</DefineConstants>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -138,10 +139,11 @@
     </PropertyGroup>
     <Error Condition="!Exists('$(SolutionDir)\.nuget\NuGet.targets')" Text="$([System.String]::Format('$(ErrorText)', '$(SolutionDir)\.nuget\NuGet.targets'))" />
   </Target>
+  <Target Name="ShowPowershellVersion" BeforeTargets="PrepareForBuild">
+	<Message Importance="high" Text="Powershell version = '$(PowerShellVersion)'" />
+  </Target>
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
        Other similar extension points exist, see Microsoft.Common.targets.
-  <Target Name="BeforeBuild">
-  </Target>
   <Target Name="AfterBuild">
   </Target>
   -->
