@@ -6,6 +6,7 @@
 using Microsoft.PowerShell.EditorServices.Protocol.Client;
 using Microsoft.PowerShell.EditorServices.Protocol.DebugAdapter;
 using Microsoft.PowerShell.EditorServices.Protocol.LanguageServer;
+using Microsoft.PowerShell.EditorServices.Protocol.MessageProtocol;
 using Microsoft.PowerShell.EditorServices.Protocol.MessageProtocol.Channel;
 using Microsoft.PowerShell.EditorServices.Protocol.Messages;
 using System;
@@ -36,7 +37,8 @@ namespace Microsoft.PowerShell.EditorServices.Test.Host
                 new LanguageServiceClient(
                     new StdioClientChannel(
                         "Microsoft.PowerShell.EditorServices.Host.exe",
-                        "/logPath:\"" + testLogPath + "\""));
+                        "/logPath:\"" + testLogPath + "\"",
+                        "/logLevel:Verbose"));
 
             return this.languageServiceClient.Start();
         }
@@ -126,7 +128,7 @@ namespace Microsoft.PowerShell.EditorServices.Test.Host
                         c => c.Label == "$ConsoleFileName");
 
             Assert.NotNull(consoleFileNameItem);
-            Assert.Equal("string", consoleFileNameItem.Detail);
+            Assert.Equal("[string]", consoleFileNameItem.Detail);
         }
 
         [Fact(Skip = "Skipped until variable documentation gathering is added back.")]
@@ -435,7 +437,7 @@ namespace Microsoft.PowerShell.EditorServices.Test.Host
         [Fact]
         public async Task ServiceExecutesReplCommandAndReceivesOutput()
         {
-            this.QueueEventsForType(OutputEvent.Type);
+            OutputReader outputReader = new OutputReader(this.protocolClient);
 
             await 
                 this.SendRequest(
@@ -445,13 +447,9 @@ namespace Microsoft.PowerShell.EditorServices.Test.Host
                         Expression = "1 + 2"
                     });
 
-            OutputEventBody outputEvent = await this.WaitForEvent(OutputEvent.Type);
-            Assert.Equal("1 + 2\r\n\r\n", outputEvent.Output);
-            Assert.Equal("stdout", outputEvent.Category);
-
-            outputEvent = await this.WaitForEvent(OutputEvent.Type);
-            Assert.Equal("3\r\n", outputEvent.Output);
-            Assert.Equal("stdout", outputEvent.Category);
+            Assert.Equal("1 + 2", await outputReader.ReadLine());
+            await outputReader.ReadLine(); // Skip the empty line
+            Assert.Equal("3", await outputReader.ReadLine());
         }
 
         [Fact]
@@ -468,6 +466,8 @@ namespace Microsoft.PowerShell.EditorServices.Test.Host
         [Fact]
         public async Task ServiceExecutesReplCommandAndReceivesChoicePrompt()
         {
+            OutputReader outputReader = new OutputReader(this.protocolClient);
+
             string choiceScript =
                 @"
                 $caption = ""Test Choice"";
@@ -477,8 +477,8 @@ namespace Microsoft.PowerShell.EditorServices.Test.Host
                 $choices = [System.Management.Automation.Host.ChoiceDescription[]]($choiceA,$choiceB);
                 $host.ui.PromptForChoice($caption, $message, $choices, 1)";
 
-            Task<ShowChoicePromptNotification> choicePromptTask =
-                this.WaitForEvent(ShowChoicePromptNotification.Type);
+            Task<Tuple<ShowChoicePromptRequest, RequestContext<ShowChoicePromptResponse>>> choicePromptTask =
+                this.WaitForRequest(ShowChoicePromptRequest.Type);
 
             // Execute the script but don't await the task yet because
             // the choice prompt will block execution from completing
@@ -491,26 +491,117 @@ namespace Microsoft.PowerShell.EditorServices.Test.Host
                         Context = "repl"
                     });
 
-            // Wait for the choice prompt event and check expected values
-            ShowChoicePromptNotification showChoicePromptEvent = await choicePromptTask;
+            // Wait for the choice prompt request and check expected values
+            Tuple<ShowChoicePromptRequest, RequestContext<ShowChoicePromptResponse>> requestResponseContext = await choicePromptTask;
+            ShowChoicePromptRequest showChoicePromptRequest = requestResponseContext.Item1;
+            RequestContext<ShowChoicePromptResponse> requestContext = requestResponseContext.Item2;
 
-            Assert.Equal(1, showChoicePromptEvent.DefaultChoice);
+            Assert.Equal(1, showChoicePromptRequest.DefaultChoice);
 
-            // Prepare to receive script output
-            Task<OutputEventBody> outputTask = this.WaitForEvent(OutputEvent.Type);
-
-            // Respond to the prompt event
-            await this.SendEvent(
-                CompleteChoicePromptNotification.Type,
-                new CompleteChoicePromptNotification
+            // Respond to the prompt request
+            await requestContext.SendResult(
+                new ShowChoicePromptResponse
                 {
                     ChosenItem = "a"
                 });
 
+            // Skip the initial script lines (6 script lines plus 3 blank lines)
+            await outputReader.ReadLines(9);
+
             // Wait for the selection to appear as output
             await evaluateTask;
-            OutputEventBody choiceOutput = await outputTask;
-            Assert.Equal("0\r\n", choiceOutput.Output);
+            Assert.Equal("0", await outputReader.ReadLine());
+        }
+
+        [Fact]
+        public async Task ServiceExecutesReplCommandAndReceivesInputPrompt()
+        {
+            OutputReader outputReader = new OutputReader(this.protocolClient);
+
+            string promptScript =
+                @"
+                $NameField = New-Object System.Management.Automation.Host.FieldDescription ""Name""
+                $NameField.SetParameterType([System.String])
+                $fields = [System.Management.Automation.Host.FieldDescription[]]($NameField)
+                $host.ui.Prompt($null, $null, $fields)";
+
+            Task<Tuple<ShowInputPromptRequest, RequestContext<ShowInputPromptResponse>>> inputPromptTask =
+                this.WaitForRequest(ShowInputPromptRequest.Type);
+
+            // Execute the script but don't await the task yet because
+            // the choice prompt will block execution from completing
+            Task<EvaluateResponseBody> evaluateTask =
+                this.SendRequest(
+                    EvaluateRequest.Type,
+                    new EvaluateRequestArguments
+                    {
+                        Expression = promptScript,
+                        Context = "repl"
+                    });
+            
+            // Wait for the input prompt request and check expected values
+            Tuple<ShowInputPromptRequest, RequestContext<ShowInputPromptResponse>> requestResponseContext = await inputPromptTask;
+            ShowInputPromptRequest showInputPromptRequest = requestResponseContext.Item1;
+            RequestContext<ShowInputPromptResponse> requestContext = requestResponseContext.Item2;
+
+            Assert.Equal("Name", showInputPromptRequest.Name);
+
+            // Respond to the prompt request
+            await requestContext.SendResult(
+                new ShowInputPromptResponse
+                {
+                    ResponseText = "John"
+                });
+
+            // Skip the initial script lines (4 script lines plus 2 blank lines)
+            string[] scriptLines = await outputReader.ReadLines(6);
+
+            // In some cases an extra newline appears after the script lines.
+            // I have no idea why this happens, but it normally seems to occur
+            // on my local machine and not the CI server.  For now, adjust for
+            // it here.
+            string outputLine = await outputReader.ReadLine();
+            if (string.IsNullOrEmpty(outputLine))
+            {
+                outputLine = await outputReader.ReadLine();
+            }
+
+            // Verify the first line
+            Assert.Equal("Name: John", outputLine);
+
+            // Verify the rest of the output
+            string[] outputLines = await outputReader.ReadLines(4);
+            Assert.Equal("", outputLines[0]);
+            Assert.Equal("Key  Value", outputLines[1]);
+            Assert.Equal("---  -----", outputLines[2]);
+            Assert.Equal("Name John ", outputLines[3]);
+
+            // Wait for execution to complete
+            await evaluateTask;
+        }
+
+        [Fact]
+        public async Task ServiceExecutesNativeCommandAndReceivesCommand()
+        {
+            OutputReader outputReader = new OutputReader(this.protocolClient);
+
+            // Execute the script but don't await the task yet because
+            // the choice prompt will block execution from completing
+            Task<EvaluateResponseBody> evaluateTask =
+                this.SendRequest(
+                    EvaluateRequest.Type,
+                    new EvaluateRequestArguments
+                    {
+                        Expression = "cmd.exe /c 'echo Test Output'",
+                        Context = "repl"
+                    });
+
+            // Skip the command line and the following newline
+            await outputReader.ReadLines(2);
+
+            // Wait for the selection to appear as output
+            await evaluateTask;
+            Assert.Equal("Test Output", await outputReader.ReadLine());
         }
 
         private async Task SendOpenFileEvent(string filePath, bool waitForDiagnostics = true)

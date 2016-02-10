@@ -3,6 +3,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 //
 
+using Microsoft.PowerShell.EditorServices.Protocol.MessageProtocol;
 using Microsoft.PowerShell.EditorServices.Protocol.Server;
 using Microsoft.PowerShell.EditorServices.Utility;
 using System;
@@ -17,6 +18,28 @@ namespace Microsoft.PowerShell.EditorServices.Host
         [STAThread]
         static void Main(string[] args)
         {
+#if DEBUG
+            bool waitForDebugger =
+                args.Any(
+                    arg => 
+                        string.Equals(
+                            arg,
+                            "/waitForDebugger",
+                            StringComparison.InvariantCultureIgnoreCase));
+
+            if (waitForDebugger)
+            {
+                if (Debugger.IsAttached)
+                {
+                    Debugger.Break();
+                }
+                else
+                {
+                    Debugger.Launch();
+                }
+            }
+#endif
+
             string logPath = null;
             string logPathArgument =
                 args.FirstOrDefault(
@@ -30,6 +53,23 @@ namespace Microsoft.PowerShell.EditorServices.Host
                 logPath = logPathArgument.Substring(9).Trim('"');
             }
 
+            LogLevel logLevel = LogLevel.Normal;
+            string logLevelArgument =
+                args.FirstOrDefault(
+                    arg => 
+                        arg.StartsWith(
+                            "/logLevel:",
+                            StringComparison.InvariantCultureIgnoreCase));
+
+            if (!string.IsNullOrEmpty(logLevelArgument))
+            {
+                // Attempt to parse the log level
+                Enum.TryParse<LogLevel>(
+                    logLevelArgument.Substring(10).Trim('"'),
+                    true,
+                    out logLevel);
+            }
+
             bool runDebugAdapter =
                 args.Any(
                     arg => 
@@ -41,7 +81,7 @@ namespace Microsoft.PowerShell.EditorServices.Host
             // Catch unhandled exceptions for logging purposes
             AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
 
-            ProtocolServer server = null;
+            ProtocolEndpoint server = null;
             if (runDebugAdapter)
             {
                 logPath = logPath ?? "DebugAdapter.log";
@@ -53,46 +93,8 @@ namespace Microsoft.PowerShell.EditorServices.Host
                 server = new LanguageServer();
             }
 
-            // Start the logger with the specified log path
-            // TODO: Set the level based on command line parameter
-            Logger.Initialize(logPath, LogLevel.Verbose);
-
-#if DEBUG
-            bool waitForDebugger =
-                args.Any(
-                    arg => 
-                        string.Equals(
-                            arg,
-                            "/waitForDebugger",
-                            StringComparison.InvariantCultureIgnoreCase));
-
-            // Should we wait for the debugger before starting?
-            if (waitForDebugger)
-            {
-                Logger.Write(LogLevel.Normal, "Waiting for debugger to attach before continuing...");
-
-                // Wait for 15 seconds and then continue
-                int waitCountdown = 15;
-                while (!Debugger.IsAttached && waitCountdown > 0)
-                {
-                    Thread.Sleep(1000);
-                    waitCountdown--;
-                }
-
-                if (Debugger.IsAttached)
-                {
-                    Logger.Write(
-                        LogLevel.Normal,
-                        "Debugger attached, continuing startup sequence");
-                }
-                else if (waitCountdown == 0)
-                {
-                    Logger.Write(
-                        LogLevel.Normal,
-                        "Timed out while waiting for debugger to attach, continuing startup sequence");
-                }
-            }
-#endif
+            // Start the logger with the specified log path and level
+            Logger.Initialize(logPath, logLevel);
 
             FileVersionInfo fileVersionInfo =
                 FileVersionInfo.GetVersionInfo(
@@ -101,11 +103,12 @@ namespace Microsoft.PowerShell.EditorServices.Host
             Logger.Write(
                 LogLevel.Normal,
                 string.Format(
-                    "PowerShell Editor Services Host v{0} starting...",
-                    fileVersionInfo.FileVersion));
+                    "PowerShell Editor Services Host v{0} starting (pid {1})...",
+                    fileVersionInfo.FileVersion,
+                    Process.GetCurrentProcess().Id));
 
             // Start the server
-            server.Start();
+            server.Start().Wait();
             Logger.Write(LogLevel.Normal, "PowerShell Editor Services Host started!");
 
             // Wait for the server to finish

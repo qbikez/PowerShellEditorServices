@@ -77,9 +77,13 @@ namespace Microsoft.PowerShell.EditorServices
 
             if (lineNumbers.Length > 0)
             {
+                // Fix for issue #123 - file paths that contain wildcard chars [ and ] need to
+                // quoted and have those wildcard chars escaped.
+                string escapedScriptPath = PowerShellContext.EscapeWildcardsInPath(scriptFile.FilePath);
+
                 PSCommand psCommand = new PSCommand();
                 psCommand.AddCommand("Set-PSBreakpoint");
-                psCommand.AddParameter("Script", scriptFile.FilePath);
+                psCommand.AddParameter("Script", escapedScriptPath);
                 psCommand.AddParameter("Line", lineNumbers.Length > 0 ? lineNumbers : null);
 
                 resultBreakpoints =
@@ -360,16 +364,19 @@ namespace Microsoft.PowerShell.EditorServices
                 new VariableContainerDetails(this.nextVariableId++, "Scope: " + scope);
             this.variables.Add(scopeVariableContainer);
 
-            var results = await this.powerShellContext.ExecuteCommand<PSVariable>(psCommand);
-            foreach (PSVariable psvariable in results)
+            var results = await this.powerShellContext.ExecuteCommand<PSVariable>(psCommand, sendErrorToHost: false);
+            if (results != null)
             {
-                var variableDetails = new VariableDetails(psvariable) { Id = this.nextVariableId++ };
-                this.variables.Add(variableDetails);
-                scopeVariableContainer.Children.Add(variableDetails.Name, variableDetails);
-
-                if ((autoVariables != null) && AddToAutoVariables(psvariable, scope))
+                foreach (PSVariable psvariable in results)
                 {
-                    autoVariables.Children.Add(variableDetails.Name, variableDetails);
+                    var variableDetails = new VariableDetails(psvariable) {Id = this.nextVariableId++};
+                    this.variables.Add(variableDetails);
+                    scopeVariableContainer.Children.Add(variableDetails.Name, variableDetails);
+
+                    if ((autoVariables != null) && AddToAutoVariables(psvariable, scope))
+                    {
+                        autoVariables.Children.Add(variableDetails.Name, variableDetails);
+                    }
                 }
             }
 

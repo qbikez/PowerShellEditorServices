@@ -8,7 +8,6 @@ using Microsoft.PowerShell.EditorServices.Protocol.MessageProtocol;
 using Microsoft.PowerShell.EditorServices.Protocol.MessageProtocol.Channel;
 using Microsoft.PowerShell.EditorServices.Protocol.Messages;
 using Microsoft.PowerShell.EditorServices.Utility;
-using Nito.AsyncEx;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -21,11 +20,12 @@ using DebugAdapterMessages = Microsoft.PowerShell.EditorServices.Protocol.DebugA
 
 namespace Microsoft.PowerShell.EditorServices.Protocol.Server
 {
-    public class LanguageServer : LanguageServerBase, IEventWriter
+    public class LanguageServer : LanguageServerBase
     {
         private static CancellationTokenSource existingRequestCancellation;
 
         private EditorSession editorSession;
+        private OutputDebouncer outputDebouncer;
         private LanguageServerSettings currentSettings = new LanguageServerSettings();
 
         public LanguageServer() : this(new StdioServerChannel())
@@ -42,7 +42,12 @@ namespace Microsoft.PowerShell.EditorServices.Protocol.Server
             // TODO: This will change later once we have a general REPL available
             // in VS Code.
             this.editorSession.ConsoleService.PushPromptHandlerContext(
-                new ProtocolPromptHandlerContext(this));
+                new ProtocolPromptHandlerContext(
+                    this,
+                    this.editorSession.ConsoleService));
+
+            // Set up the output debouncer to throttle output event writes
+            this.outputDebouncer = new OutputDebouncer(this);
         }
 
         protected override void Initialize()
@@ -68,13 +73,18 @@ namespace Microsoft.PowerShell.EditorServices.Protocol.Server
 
             this.SetRequestHandler(ShowOnlineHelpRequest.Type, this.HandleShowOnlineHelpRequest);
             this.SetRequestHandler(ExpandAliasRequest.Type, this.HandleExpandAliasRequest);
-            this.SetEventHandler(CompleteChoicePromptNotification.Type, this.HandleCompleteChoicePromptNotification);
+
+            this.SetRequestHandler(FindModuleRequest.Type, this.HandleFindModuleRequest);
+            this.SetRequestHandler(InstallModuleRequest.Type, this.HandleInstallModuleRequest);
 
             this.SetRequestHandler(DebugAdapterMessages.EvaluateRequest.Type, this.HandleEvaluateRequest);
         }
 
         protected override void Shutdown()
         {
+            // Make sure remaining output is flushed before exiting
+            this.outputDebouncer.Flush().Wait();
+
             Logger.Write(LogLevel.Normal, "Language service is shutting down...");
 
             if (this.editorSession != null)
@@ -129,11 +139,27 @@ namespace Microsoft.PowerShell.EditorServices.Protocol.Server
             psCommand.AddArgument(helpParams);
             psCommand.AddParameter("Online");
 
-            await editorSession.PowerShellContext.ExecuteCommand<object>(
-                    psCommand);
+            await editorSession.PowerShellContext.ExecuteCommand<object>(psCommand);
 
             await requestContext.SendResult(null);
         }
+
+        private async Task HandleInstallModuleRequest(
+            string moduleName,
+            RequestContext<object> requestContext
+        )
+        {
+            var script = string.Format("Install-Module -Name {0} -Scope CurrentUser", moduleName);
+
+            var executeTask =
+               editorSession.PowerShellContext.ExecuteScriptString(
+                   script,
+                   true,
+                   true).ConfigureAwait(false);
+
+            await requestContext.SendResult(null);
+        }
+
 
         private async Task HandleExpandAliasRequest(
             string content,
@@ -173,23 +199,26 @@ function __Expand-Alias {
             await requestContext.SendResult(result.First().ToString());
         }
 
-        protected Task HandleCompleteChoicePromptNotification(
-            CompleteChoicePromptNotification completeChoicePromptParams,
-            EventContext eventContext)
+        private async Task HandleFindModuleRequest(
+            object param,
+            RequestContext<object> requestContext)
         {
-            if (!completeChoicePromptParams.PromptCancelled)
+            var psCommand = new PSCommand();
+            psCommand.AddScript("Find-Module | Select Name, Description");
+
+            var modules = await editorSession.PowerShellContext.ExecuteCommand<PSObject>(psCommand);
+
+            var moduleList = new List<PSModuleMessage>();
+
+            if (modules != null)
             {
-                this.editorSession.ConsoleService.ReceiveInputString(
-                    completeChoicePromptParams.ChosenItem,
-                    false);
-            }
-            else
-            {
-                // Cancel the current prompt
-                this.editorSession.ConsoleService.SendControlC();
+                foreach (dynamic m in modules)
+                {
+                    moduleList.Add(new PSModuleMessage { Name = m.Name, Description = m.Description });
+                }
             }
 
-            return Task.FromResult(true);
+            await requestContext.SendResult(moduleList);
         }
 
         protected Task HandleDidOpenTextDocumentNotification(
@@ -390,17 +419,15 @@ function __Expand-Alias {
 
             if (completionResults != null)
             {
-                // By default, insert the completion at the current location
-                int startEditColumn = textDocumentPosition.Position.Character;
-                int endEditColumn = textDocumentPosition.Position.Character;
-
+                int sortIndex = 1;
                 completionItems =
                     completionResults
                         .Completions
                         .Select(
                             c => CreateCompletionItem(
                                 c,
-                                completionResults.ReplacedRange))
+                                completionResults.ReplacedRange,
+                                sortIndex++))
                         .ToArray();
             }
             else
@@ -698,7 +725,7 @@ function __Expand-Alias {
             return symbolName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        protected async Task HandleEvaluateRequest(
+        protected Task HandleEvaluateRequest(
             DebugAdapterMessages.EvaluateRequestArguments evaluateParams,
             RequestContext<DebugAdapterMessages.EvaluateResponseBody> requestContext)
         {
@@ -710,16 +737,25 @@ function __Expand-Alias {
                 this.editorSession.PowerShellContext.ExecuteScriptString(
                     evaluateParams.Expression,
                     true,
-                    true).ConfigureAwait(false);
+                    true);
 
-            // Return an empty result since the result value is irrelevant
-            // for this request in the LanguageServer
-            await requestContext.SendResult(
-                new DebugAdapterMessages.EvaluateResponseBody
+            // Return the execution result after the task completes so that the
+            // caller knows when command execution completed.
+            executeTask.ContinueWith(
+                (task) =>
                 {
-                    Result = "",
-                    VariablesReference = 0
+                    // Return an empty result since the result value is irrelevant
+                    // for this request in the LanguageServer
+                    return
+                        requestContext.SendResult(
+                            new DebugAdapterMessages.EvaluateResponseBody
+                            {
+                                Result = "",
+                                VariablesReference = 0
+                            });
                 });
+
+            return Task.FromResult(true);
         }
 
         #endregion
@@ -728,13 +764,8 @@ function __Expand-Alias {
 
         async void powerShellContext_OutputWritten(object sender, OutputWrittenEventArgs e)
         {
-            await this.SendEvent(
-                DebugAdapterMessages.OutputEvent.Type,
-                new DebugAdapterMessages.OutputEventBody
-                {
-                    Output = e.OutputText + (e.IncludeNewLine ? "\r\n" : string.Empty),
-                    Category = (e.OutputType == OutputType.Error) ? "stderr" : "stdout"
-                });
+            // Queue the output for writing
+            await this.outputDebouncer.Invoke(e);
         }
 
         #endregion
@@ -780,7 +811,7 @@ function __Expand-Alias {
             if (!this.currentSettings.ScriptAnalysis.Enable.Value)
             {
                 // If the user has disabled script analysis, skip it entirely
-                return TaskConstants.Completed;
+                return Task.FromResult(true);
             }
 
             // If there's an existing task, attempt to cancel it
@@ -806,7 +837,9 @@ function __Expand-Alias {
                         "Exception while cancelling analysis task:\n\n{0}",
                         e.ToString()));
 
-                return TaskConstants.Canceled;
+                TaskCompletionSource<bool> cancelTask = new TaskCompletionSource<bool>();
+                cancelTask.SetCanceled();
+                return cancelTask.Task;
             }
 
             // Create a fresh cancellation token and then start the task.
@@ -826,7 +859,7 @@ function __Expand-Alias {
                 TaskCreationOptions.None,
                 TaskScheduler.Default);
 
-            return TaskConstants.Completed;
+            return Task.FromResult(true);
         }
 
         private static async Task DelayThenInvokeDiagnostics(
@@ -875,7 +908,7 @@ function __Expand-Alias {
             Logger.Write(LogLevel.Verbose, "Analysis complete.");
         }
 
-        private async static Task PublishScriptDiagnostics(
+        private static async Task PublishScriptDiagnostics(
             ScriptFile scriptFile,
             ScriptFileMarker[] semanticMarkers,
             EventContext eventContext)
@@ -943,26 +976,76 @@ function __Expand-Alias {
 
         private static CompletionItem CreateCompletionItem(
             CompletionDetails completionDetails,
-            BufferRange completionRange)
+            BufferRange completionRange,
+            int sortIndex)
         {
             string detailString = null;
+            string documentationString = null;
+            string labelString = completionDetails.ListItemText;
 
-            if (completionDetails.CompletionType == CompletionType.Variable)
+            if ((completionDetails.CompletionType == CompletionType.Variable) ||
+                (completionDetails.CompletionType == CompletionType.ParameterName))
             {
-                // Look for variable type encoded in the tooltip
-                var matches = Regex.Matches(completionDetails.ToolTipText, @"^\[(.+)\]");
-
-                if (matches.Count > 0 && matches[0].Groups.Count > 1)
+                // Look for type encoded in the tooltip for parameters and variables.
+                // Display PowerShell type names in [] to be consistent with PowerShell syntax
+                // and now the debugger displays type names.
+                var matches = Regex.Matches(completionDetails.ToolTipText, @"^(\[.+\])");
+                if ((matches.Count > 0) && (matches[0].Groups.Count > 1))
                 {
                     detailString = matches[0].Groups[1].Value;
                 }
+
+                // PowerShell returns ListItemText for parameters & variables that is not prefixed
+                // and it needs to be or the completion will not appear for these CompletionTypes.
+                string prefix = (completionDetails.CompletionType == CompletionType.Variable) ? "$" : "-";
+                labelString = prefix + completionDetails.ListItemText;
             }
+            else if ((completionDetails.CompletionType == CompletionType.Method) ||
+                     (completionDetails.CompletionType == CompletionType.Property))
+            {
+                // We have a raw signature for .NET members, heck let's display it.  It's
+                // better than nothing.
+                documentationString = completionDetails.ToolTipText;
+            }
+            else if (completionDetails.CompletionType == CompletionType.Command)
+            {
+                // For Commands, let's extract the resolved command or the path for an exe
+                // from the ToolTipText - if there is any ToolTipText.
+                if (completionDetails.ToolTipText != null)
+                {
+                    // Don't display ToolTipText if it is the same as the ListItemText.
+                    // Reject command syntax ToolTipText - it's too much to display as a detailString.
+                    if (!completionDetails.ListItemText.Equals(
+                            completionDetails.ToolTipText,
+                            StringComparison.OrdinalIgnoreCase) &&
+                        !Regex.IsMatch(completionDetails.ToolTipText, 
+                            @"^\s*" + completionDetails.ListItemText + @"\s+\["))
+                    {
+                        detailString = completionDetails.ToolTipText;
+                    }
+                }
+            }
+
+            // We want a special "sort order" for parameters that is not lexicographical.
+            // Fortunately, PowerShell returns parameters in the preferred sort order by
+            // default (with common params at the end). We just need to make sure the default
+            // order also be the lexicographical order which we do by prefixig the ListItemText
+            // with a leading 0's four digit index.  This would not sort correctly for a list
+            // > 999 parameters but surely we won't have so many items in the "parameter name" 
+            // completion list. Technically we don't need the ListItemText at all but it may come
+            // in handy during debug.
+            var sortText = (completionDetails.CompletionType == CompletionType.ParameterName)
+                  ? string.Format("{0:D3}{1}", sortIndex, completionDetails.ListItemText)
+                  : null;
 
             return new CompletionItem
             {
-                Label = completionDetails.CompletionText,
+                InsertText = completionDetails.CompletionText,
+                Label = labelString,
                 Kind = MapCompletionKind(completionDetails.CompletionType),
                 Detail = detailString,
+                Documentation = documentationString,
+                SortText = sortText,
                 TextEdit = new TextEdit
                 {
                     NewText = completionDetails.CompletionText,

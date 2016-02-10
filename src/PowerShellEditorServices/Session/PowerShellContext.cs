@@ -3,8 +3,8 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 //
 
+using Microsoft.PowerShell.EditorServices.Console;
 using Microsoft.PowerShell.EditorServices.Utility;
-using Nito.AsyncEx;
 using System;
 using System.Collections;
 using System.Globalization;
@@ -17,10 +17,9 @@ using System.Threading.Tasks;
 
 namespace Microsoft.PowerShell.EditorServices
 {
-    using Microsoft.PowerShell.EditorServices.Console;
     using System.Management.Automation;
-    using System.Management.Automation.Host;
     using System.Management.Automation.Runspaces;
+    using System.Reflection;
 
     /// <summary>
     /// Manages the lifetime and usage of a PowerShell session.
@@ -45,8 +44,7 @@ namespace Microsoft.PowerShell.EditorServices
         private TaskCompletionSource<IPipelineExecutionRequest> pipelineResultTask;
 
         private object runspaceMutex = new object();
-        private RunspaceHandle currentRunspaceHandle;
-        private IAsyncWaitQueue<RunspaceHandle> runspaceWaitQueue = new DefaultAsyncWaitQueue<RunspaceHandle>();
+        private AsyncQueue<RunspaceHandle> runspaceWaitQueue = new AsyncQueue<RunspaceHandle>();
 
         #endregion
 
@@ -116,6 +114,24 @@ namespace Microsoft.PowerShell.EditorServices
             this.ownsInitialRunspace = true;
 
             this.Initialize(runspace);
+
+            // Use reflection to execute ConsoleVisibility.AlwaysCaptureApplicationIO = true;
+            Type consoleVisibilityType =
+                Type.GetType(
+                    "System.Management.Automation.ConsoleVisibility, System.Management.Automation, Version=3.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35");
+
+            if (consoleVisibilityType != null)
+            {
+                PropertyInfo propertyInfo =
+                    consoleVisibilityType.GetProperty(
+                        "AlwaysCaptureApplicationIO",
+                        BindingFlags.Static | BindingFlags.Public);
+
+                if (propertyInfo != null)
+                {
+                    propertyInfo.SetValue(null, true);
+                }
+            }
         }
 
         /// <summary>
@@ -165,6 +181,10 @@ namespace Microsoft.PowerShell.EditorServices
 #endif
 
             this.SessionState = PowerShellContextState.Ready;
+
+            // Now that the runspace is ready, enqueue it for first use
+            RunspaceHandle runspaceHandle = new RunspaceHandle(this.currentRunspace, this);
+            this.runspaceWaitQueue.EnqueueAsync(runspaceHandle).Wait();
         }
 
         private Version GetPowerShellVersion()
@@ -199,21 +219,19 @@ namespace Microsoft.PowerShell.EditorServices
         /// <returns>A RunspaceHandle instance that gives access to the session's runspace.</returns>
         public Task<RunspaceHandle> GetRunspaceHandle()
         {
-            lock (this.runspaceMutex)
-            {
-                if (this.currentRunspaceHandle == null)
-                {
-                    this.currentRunspaceHandle = new RunspaceHandle(this.currentRunspace, this);
-                    TaskCompletionSource<RunspaceHandle> tcs = new TaskCompletionSource<RunspaceHandle>();
-                    tcs.SetResult(this.currentRunspaceHandle);
-                    return tcs.Task;
-                }
-                else
-                {
-                    // TODO: Use CancellationToken?
-                    return this.runspaceWaitQueue.Enqueue();
-                }
-            }
+            return this.GetRunspaceHandle(CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Gets a RunspaceHandle for the session's runspace.  This
+        /// handle is used to gain temporary ownership of the runspace
+        /// so that commands can be executed against it directly.
+        /// </summary>
+        /// <param name="cancellationToken">A CancellationToken that can be used to cancel the request.</param>
+        /// <returns>A RunspaceHandle instance that gives access to the session's runspace.</returns>
+        public Task<RunspaceHandle> GetRunspaceHandle(CancellationToken cancellationToken)
+        {
+            return this.runspaceWaitQueue.DequeueAsync(cancellationToken);
         }
 
         /// <summary>
@@ -225,13 +243,17 @@ namespace Microsoft.PowerShell.EditorServices
         /// <param name="sendOutputToHost">
         /// If true, causes any output written during command execution to be written to the host.
         /// </param>
+        /// <param name="sendErrorToHost">
+        /// If true, causes any errors encountered during command execution to be written to the host.
+        /// </param>
         /// <returns>
         /// An awaitable Task which will provide results once the command
         /// execution completes.
         /// </returns>
         public async Task<IEnumerable<TResult>> ExecuteCommand<TResult>(
             PSCommand psCommand,
-            bool sendOutputToHost = false)
+            bool sendOutputToHost = false,
+            bool sendErrorToHost = true)
         {
             RunspaceHandle runspaceHandle = null;
             IEnumerable<TResult> executionResult = null;
@@ -341,8 +363,11 @@ namespace Microsoft.PowerShell.EditorServices
                         LogLevel.Error,
                         "Runtime exception occurred while executing command:\r\n\r\n" + e.ToString());
 
-                    // Write the error to the host
-                    this.WriteExceptionToHost(e);
+                    if (sendErrorToHost)
+                    {
+                        // Write the error to the host
+                        this.WriteExceptionToHost(e);
+                    }
                 }
                 finally
                 {
@@ -425,11 +450,22 @@ namespace Microsoft.PowerShell.EditorServices
         /// Executes a script file at the specified path.
         /// </summary>
         /// <param name="scriptPath">The path to the script file to execute.</param>
+        /// <param name="arguments">Arguments to pass to the script.</param>
         /// <returns>A Task that can be awaited for completion.</returns>
-        public async Task ExecuteScriptAtPath(string scriptPath)
+        public async Task ExecuteScriptAtPath(string scriptPath, string arguments = null)
         {
+            // If we don't escape wildcard characters in the script path, the script can
+            // fail to execute if say the script name was foo][.ps1.
+            // Related to issue #123.
+            string escapedScriptPath = EscapeWildcardsInPath(scriptPath);
+
+            if (arguments != null)
+            {
+                escapedScriptPath += " " + arguments;
+            }
+
             PSCommand command = new PSCommand();
-            command.AddCommand(scriptPath);
+            command.AddScript(escapedScriptPath);
 
             await this.ExecuteCommand<object>(command, true);
         }
@@ -526,31 +562,28 @@ namespace Microsoft.PowerShell.EditorServices
         {
             Validate.IsNotNull("runspaceHandle", runspaceHandle);
 
-            IDisposable dequeuedTask = null;
-
-            lock (this.runspaceMutex)
+            if (this.runspaceWaitQueue.IsEmpty)
             {
-                if (runspaceHandle != this.currentRunspaceHandle)
-                {
-                    throw new InvalidOperationException("Released runspace handle was not the current handle.");
-                }
-
-                this.currentRunspaceHandle = null;
-
-                if (!this.runspaceWaitQueue.IsEmpty)
-                {
-                    this.currentRunspaceHandle = new RunspaceHandle(this.currentRunspace, this);
-                    dequeuedTask =
-                        this.runspaceWaitQueue.Dequeue(
-                            this.currentRunspaceHandle);
-                }
+                var newRunspaceHandle = new RunspaceHandle(this.currentRunspace, this);
+                this.runspaceWaitQueue.EnqueueAsync(newRunspaceHandle).Wait();
             }
-
-            // If a queued task was dequeued, call Dispose to cause it to be executed.
-            if (dequeuedTask != null)
+            else
             {
-                dequeuedTask.Dispose();
+                // Write the situation to the log since this shouldn't happen
+                Logger.Write(
+                    LogLevel.Error,
+                    "The PowerShellContext.runspaceWaitQueue has more than one item");
             }
+        }
+
+        /// <summary>
+        /// Returns the passed in path with the [ and ] wildcard characters escaped.
+        /// </summary>
+        /// <param name="path">The path to process.</param>
+        /// <returns>The path with [ and ] escaped.</returns>
+        internal static string EscapeWildcardsInPath(string path)
+        {
+            return path.Replace("[", "`[").Replace("]", "`]");
         }
 
         #endregion
@@ -567,9 +600,10 @@ namespace Microsoft.PowerShell.EditorServices
             Logger.Write(
                 LogLevel.Verbose,
                 string.Format(
-                    "Session state changed --\r\n\r\n    Old state: {0}\r\n    New state: {1}",
+                    "Session state changed --\r\n\r\n    Old state: {0}\r\n    New state: {1}\r\n    Result: {2}",
                     this.SessionState.ToString(),
-                    e.NewSessionState.ToString()));
+                    e.NewSessionState.ToString(),
+                    e.ExecutionResult));
 
             this.SessionState = e.NewSessionState;
 
@@ -895,10 +929,15 @@ namespace Microsoft.PowerShell.EditorServices
                 Environment.NewLine,
                 false);
 
+            // Trim the '>' off the end of the prompt string to reduce
+            // user confusion about where they can type.
+            // TODO: Eventually put this behind a setting, #133
+            promptString = promptString.TrimEnd(' ', '>', '\r', '\n');
+
             // Write the prompt string
             this.WriteOutput(
                 promptString,
-                false);
+                true);
         }
 
         private void WritePromptWithRunspace(Runspace runspace)
@@ -964,7 +1003,8 @@ namespace Microsoft.PowerShell.EditorServices
                     null));
 
             // Write out the debugger prompt
-            this.WritePromptWithNestedPipeline();
+            // TODO: Eventually re-enable this and put it behind a setting, #133
+            //this.WritePromptWithNestedPipeline();
 
             // Raise the event for the debugger service
             if (this.DebuggerStop != null)
